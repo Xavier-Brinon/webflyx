@@ -1,4 +1,4 @@
-from stats import nbr_words
+from stats import nbr_words, char_frequency
 
 def get_book_text(file_path: str) -> str:
     with open(file_path, 'r', encoding="utf-8") as f:
@@ -11,5 +11,7 @@ def main():
     words: int = nbr_words(book)
     message: str = f"Found {words} total words"
     print(message)
+    frequency = char_frequency(book)
+    print(frequency)
 
 main()
