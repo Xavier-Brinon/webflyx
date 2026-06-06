@@ -7,3 +7,4 @@ advert.html
 # Asteroid game
 ## Generated logs
 game_state.jsonl
+game_events.jsonl
