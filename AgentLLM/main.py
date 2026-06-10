@@ -19,6 +19,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(description="Chatbot")
     parser.add_argument("user_prompt", type=str, help="User prompt")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()  # Now we have access to args.user_prompt.
 
     messages: list[Message] = [
@@ -26,8 +27,12 @@ def main():
     ]
 
     response: ChatResponse = chat(model="gemma4:12b", messages=messages)
-    print(f"Prompt tokens: {response.prompt_eval_count}")
-    print(f"Response tokens: {response.eval_count}")
+
+    if args.verbose:
+        print(f"User prompt: {args.user_prompt}")
+        print(f"Prompt tokens: {response.prompt_eval_count}")
+        print(f"Response tokens: {response.eval_count}")
+
     print(response.message.content)
 
 
