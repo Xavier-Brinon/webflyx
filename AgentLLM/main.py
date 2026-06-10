@@ -2,6 +2,7 @@ from ollama import (
     chat,
     ChatResponse
 )
+import argparse
 
 # Just to get the check to pass, no use.
 # load_dotenv()
@@ -14,10 +15,14 @@ from ollama import (
 # eval_count=504
 # eval_duration=10654194000
 def main():
+    parser = argparse.ArgumentParser(description="Chatbot")
+    parser.add_argument("user_prompt", type=str, help="User prompt")
+    args = parser.parse_args()  # Now we have access to args.user_prompt.
+
     response: ChatResponse = chat(model="gemma4:12b", messages=[
         {
             "role": "user",
-            "content": "Why is Boot.dev such a great place to learn backend development? Use one paragraph maximum."
+            "content": args.user_prompt
         }
     ])
     print(f"Prompt tokens: {response.prompt_eval_count}")
