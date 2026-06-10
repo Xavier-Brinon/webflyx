@@ -1,3 +1,4 @@
+from prompts import system_prompt
 from ollama import (
     chat,
     ChatResponse,
@@ -23,6 +24,7 @@ def main():
     args = parser.parse_args()  # Now we have access to args.user_prompt.
 
     messages: list[Message] = [
+        Message(role="assistant", content=system_prompt),
         Message(role="user", content=args.user_prompt)
     ]
 
