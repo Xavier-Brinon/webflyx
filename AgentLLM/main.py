@@ -1,6 +1,7 @@
 from ollama import (
     chat,
-    ChatResponse
+    ChatResponse,
+    Message
 )
 import argparse
 
@@ -8,6 +9,7 @@ import argparse
 # load_dotenv()
 # models.generate_content
 # .text
+# parts=[
 
 # load_duration=233642625
 # prompt_eval_count=35
@@ -19,12 +21,11 @@ def main():
     parser.add_argument("user_prompt", type=str, help="User prompt")
     args = parser.parse_args()  # Now we have access to args.user_prompt.
 
-    response: ChatResponse = chat(model="gemma4:12b", messages=[
-        {
-            "role": "user",
-            "content": args.user_prompt
-        }
-    ])
+    messages: list[Message] = [
+        Message(role="user", content=args.user_prompt)
+    ]
+
+    response: ChatResponse = chat(model="gemma4:12b", messages=messages)
     print(f"Prompt tokens: {response.prompt_eval_count}")
     print(f"Response tokens: {response.eval_count}")
     print(response.message.content)
