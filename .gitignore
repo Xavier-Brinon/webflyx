@@ -8,3 +8,6 @@ advert.html
 ## Generated logs
 game_state.jsonl
 game_events.jsonl
+
+# MCP LLMs
+.serena
