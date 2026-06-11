@@ -30,7 +30,7 @@ schema_get_files_info = {
     "type": "function",
     "function": {
         "name": "get_files_info",
-        "description": "Lists files in a specified directory, providing file size and directory status.",
+        "description": "List the names, sizes, and directory status of the entries inside a directory. Use this ONLY to browse or list a folder's contents. Do NOT use this to read the text inside a file -- use get_file_content for that.",
         "parameters": {
             "type": "object",
             "properties": {

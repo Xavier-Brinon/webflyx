@@ -48,3 +48,27 @@ def run_python_file(working_directory: str, file_path: str, args: list[str] | No
         return return_process
     except Exception as e:
         return f"Error: executing Python file: {e}"
+
+# functions/schemas.py
+schema_run_python_file = {
+    "type": "function",
+    "function": {
+        "name": "run_python_file",
+        "description": "Execute (run) a Python .py file and return its stdout and stderr. Use this whenever the user wants to run, execute, launch, or start a Python script (e.g. 'run main.py', 'execute tests.py').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the Python file to execute, relative to the working directory.",
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of command-line arguments to pass to the Python file."
+                }
+            },
+            "required": ["file_path"],
+        },
+    },
+}
