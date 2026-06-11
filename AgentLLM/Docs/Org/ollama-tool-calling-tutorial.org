@@ -1,0 +1,431 @@
+#+title: Tutorial: Tool Calling with Ollama in Python
+#+author: Xavier Brinon
+#+date: [2026-06-11]
+#+startup: indent
+#+options: toc:2 num:t ^:{}
+
+* The one idea you must internalize
+
+/The model never runs your code. It only asks you to./
+
+A ~chat()~ call is a single round-trip. When you give the model tools, the most
+it can do is reply "I'd like you to call ~get_file_content~ with
+~file_path="main.py"~." That is just text in a structured field. *You* run the
+function, and *you* hand the result back. "Tool calling" is therefore a /loop
+you write/, not a feature that runs itself.
+
+The whole thing has four beats, repeated:
+
+1. You send messages (+ tool definitions) to ~chat()~.
+2. Model replies: either ~tool_calls~, or a final answer.
+3. If ~tool_calls~: you execute them, append the results, go to 1.
+4. If no ~tool_calls~: done --- print ~message.content~.
+
+* What a tool call actually looks like
+
+Verified against the installed SDK, the response message exposes:
+
+#+begin_src python
+  response.message.tool_calls                          # -> list, or None
+  response.message.tool_calls[0].function.name         # str, e.g. "get_file_content"
+  response.message.tool_calls[0].function.arguments    # dict, e.g. {"file_path": "main.py"}
+#+end_src
+
+#+begin_quote
+*Gotcha:* ~arguments~ is *already a Python dict*. Some SDKs (OpenAI) hand you a
+JSON /string/ you must ~json.loads~. Ollama parses it for you, so
+~func(**arguments)~ works directly.
+#+end_quote
+
+When ~tool_calls~ is ~None~, the model is finished --- the answer is in
+~response.message.content~.
+
+* Defining your tools --- and the trap hiding in your code
+
+Ollama gives two ways to declare tools.
+
+** Option A --- pass the function directly (the easy way)
+
+#+begin_src python
+  response = chat(model="...", messages=messages, tools=[get_file_content])
+#+end_src
+
+The SDK introspects type hints and the docstring to auto-build a schema.
+Lovely --- /except/ look at your signature:
+
+#+begin_src python
+  def get_file_content(working_directory: str, file_path: str = ".") -> str:
+#+end_src
+
+Passed directly, the SDK tells the model this tool has *two* parameters,
+including ~working_directory~. Now the model can try
+~get_file_content(working_directory="/etc", file_path="passwd")~. The
+~commonpath~ guard would reject it, but the model should not even /see/ that
+parameter. Second problem: your functions have no docstrings, so the
+auto-generated schema would have no descriptions --- the model would guess what
+each tool does.
+
+** Option B --- explicit schema, hiding working_directory
+
+Write the schema by hand and simply /do not mention/ ~working_directory~. The
+model only learns the parameters it is allowed to choose:
+
+#+begin_src python
+  # functions/schemas.py
+  get_file_content_schema = {
+      "type": "function",
+      "function": {
+          "name": "get_file_content",
+          "description": "Read and return the text contents of a file in the working directory.",
+          "parameters": {
+              "type": "object",
+              "properties": {
+                  "file_path": {
+                      "type": "string",
+                      "description": "Path to the file, relative to the working directory.",
+                  },
+              },
+              "required": ["file_path"],
+          },
+      },
+  }
+#+end_src
+
+No ~working_directory~ anywhere. The model cannot ask to read outside the
+sandbox because it does not know that lever exists. *You* supply
+~working_directory~ yourself at dispatch.
+
+Do the same for the other three; ~properties~ mirror only the model-safe params:
+
+- ~get_files_info~ -> ~directory~
+- ~get_file_content~ -> ~file_path~
+- ~write_file~ -> ~file_path~, ~content~
+- ~run_python_file~ -> ~file_path~, ~args~ (an array of strings)
+
+Then gather them:
+
+#+begin_src python
+  tool_schemas = [
+      get_files_info_schema,
+      get_file_content_schema,
+      write_file_schema,
+      run_python_file_schema,
+  ]
+#+end_src
+
+#+begin_quote
+*Insight:* the schema is a /contract you show the model/; the Python function is
+the /thing you actually run/. They need not match 1:1 --- deliberately making
+them differ (hiding ~working_directory~) is how you keep authority over the
+security boundary. The model proposes within the schema; you dispose within the
+function.
+#+end_quote
+
+* The dispatch table
+
+The model gives you a function /name as a string/. Turn it into a real callable
+with a dict --- idiomatic, O(1), and easy to extend:
+
+#+begin_src python
+  available_functions = {
+      "get_files_info": get_files_info,
+      "get_file_content": get_file_content,
+      "write_file": write_file,
+      "run_python_file": run_python_file,
+  }
+#+end_src
+
+Using ~.get(name)~ also lets you detect an unknown name (a hallucinated tool)
+cleanly when it returns ~None~.
+
+* Executing a call and feeding the result back
+
+This is where ~working_directory~ injection happens:
+
+#+begin_src python
+  WORKING_DIR = "./calculator"   # set by YOU, never by the model
+
+  for tc in response.message.tool_calls:
+      fn = available_functions.get(tc.function.name)
+      if fn is None:
+          result = f"Error: unknown function {tc.function.name}"
+      else:
+          result = fn(working_directory=WORKING_DIR, **tc.function.arguments)
+          #            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ you inject the boundary here
+#+end_src
+
+Then put *two* things into the conversation history:
+
+1. The assistant message that /requested/ the call.
+2. A new message with the /result/.
+
+#+begin_src python
+  messages.append(response.message)   # the assistant's request (once per round)
+
+  messages.append({
+      "role": "tool",
+      "tool_name": tc.function.name,   # ties the result to the call by name
+      "content": str(result),          # MUST be a string
+  })
+#+end_src
+
+~tool_name~ is a real field on the SDK's ~Message~ type --- that is how the
+model matches /this result/ to /that request/. ~content~ must be a ~str~; your
+functions already return strings, so ~str(result)~ is belt-and-suspenders.
+
+#+begin_quote
+*Why returning "Error: ..." instead of raising is genius for agents:* when
+~get_file_content~ cannot find a file it returns ~'Error: File not found...'~.
+That string goes back to the model as a tool result, and the model /reads the
+error and tries again/ --- perhaps listing the directory first. Raising an
+exception would crash the loop and rob the model of self-correction. Your
+functions are already written perfectly for this.
+#+end_quote
+
+* Putting it in a loop (with a seatbelt)
+
+One round is not enough --- the model might read a file, /then/ run it, /then/
+summarize. Loop until it stops calling tools, and always cap iterations:
+
+#+begin_src python
+  MAX_ITERS = 10
+
+  messages = [
+      {"role": "system", "content": system_prompt},   # NOTE: "system", not "assistant"
+      {"role": "user", "content": args.user_prompt},
+  ]
+
+  for _ in range(MAX_ITERS):
+      response = chat(model="mistral:latest", messages=messages, tools=tool_schemas)
+      messages.append(response.message)
+
+      if not response.message.tool_calls:
+          print(response.message.content)   # final answer --- done
+          break
+
+      for tc in response.message.tool_calls:
+          fn = available_functions.get(tc.function.name)
+          result = (fn(working_directory=WORKING_DIR, **tc.function.arguments)
+                    if fn else f"Error: unknown function {tc.function.name}")
+          messages.append({
+              "role": "tool",
+              "tool_name": tc.function.name,
+              "content": str(result),
+          })
+  else:
+      print("Hit MAX_ITERS without a final answer.")  # for/else: runs if no break
+#+end_src
+
+Two corrections to the current ~main.py~ are baked in above:
+
+- The ~role="system"~ field for the system prompt. It is currently
+  ~role="assistant"~ (~main.py:27~), which tells the model /it/ said that.
+- The ~model~ field must name a tool-capable model you have pulled locally.
+  Tool calling is a per-model capability, not a per-family one: ~gemma4:12b~
+  handles it fine here (verified by running the exercise), and ~mistral:latest~
+  works too. The examples below use ~mistral:latest~, but swap in whichever you
+  run --- the loop is identical.
+
+* Trace it once, by hand
+
+User asks "what does main.py do?" with ~mistral:latest~:
+
+| Round | You send      | Model replies                             | You do                                 |
+|-------+---------------+-------------------------------------------+----------------------------------------|
+|     1 | system + user | tool_calls: get_files_info(directory=".") | run it, append listing as tool message |
+|     2 | + that result | tool_calls: get_file_content(main.py)     | run it, append source as tool message  |
+|     3 | + that result | content: "main.py is a CLI chatbot..."    | print it, break                        |
+
+Three ~chat()~ calls, two tool executions, one final answer. That table /is/ the
+loop.
+
+* Suggested implementation order
+
+1. Write the four schemas in ~functions/schemas.py~ + the ~available_functions~
+   dict. Start with /one/ tool to keep round 1 simple.
+2. Replace the joke text in ~prompts.py~ with a real system prompt.
+3. Rewrite the body of ~main.py~ as the loop above.
+4. Add ~MAX_ITERS~ to ~config.py~ next to ~MAX_CHARS~.
+5. Add ~"ollama"~ to ~dependencies~ in ~pyproject.toml~ (imported but undeclared).
+
+* Verifying as you go
+
+- *Read path:* ~uv run main.py "what files exist and what does main.py do?"
+  --verbose~ --- verbose lets you print each ~tc.function.name~ and watch the
+  rounds.
+- *Write path:* ~uv run main.py "create hello.txt that says hi"~ then check
+  ~./calculator/hello.txt~.
+- *Sandbox test:* ask it to "read /etc/passwd" --- you should see your ~outside
+  the permitted working directory~ error come back to the model, not a crash.
+  That is proof the boundary held.
+
+* Exercise: function declarations, Ollama-adapted
+
+The Boot.dev course runs this step against ~google-genai~, which ships dedicated
+builder classes (~types.FunctionDeclaration~, ~types.Schema~, ~types.Tool~) and
+a ~GenerateContentConfig~ object. Ollama has none of that ceremony --- you
+assemble the exact same structures out of plain Python ~dict~ and ~list~, and
+hand them straight to ~chat()~. Here is the assignment, step by step, with each
+Gemini idea mapped to its Ollama counterpart.
+
+** Concept mapping
+
+| Concept               | google-genai (Gemini)                     | ollama-python                                |
+|-----------------------+-------------------------------------------+----------------------------------------------|
+| One function's schema | ~types.FunctionDeclaration(...)~          | a plain ~dict~                               |
+| Parameter object      | ~types.Schema(type=types.Type.OBJECT, …)~ | ~{"type": "object", "properties": {…}}~      |
+| Bundle of tools       | ~types.Tool(function_declarations=[…])~   | a plain ~list~                               |
+| Passing to the model  | ~GenerateContentConfig(tools=[…])~        | ~chat(…, tools=[…])~                         |
+| Reading the request   | ~response.function_calls~                 | ~response.message.tool_calls~                |
+| Call name / arguments | ~fc.name~ / ~fc.args~                     | ~tc.function.name~ / ~tc.function.arguments~ |
+
+The shape is identical; only the packaging differs. Where Gemini gives you typed
+constructors, Ollama trusts you to write the JSON-schema dict yourself.
+
+** Step 1: declare get_files_info
+
+The course gives this Gemini declaration as the worked example:
+
+#+begin_src python
+  # google-genai version (for reference only)
+  from google.genai import types
+
+  schema_get_files_info = types.FunctionDeclaration(
+      name="get_files_info",
+      description="Lists files in a specified directory relative to the working directory, providing file size and directory status",
+      parameters=types.Schema(
+          type=types.Type.OBJECT,
+          properties={
+              "directory": types.Schema(
+                  type=types.Type.STRING,
+                  description="Directory path to list files from, relative to the working directory (default is the working directory itself)",
+              ),
+          },
+      ),
+  )
+#+end_src
+
+The Ollama equivalent is a dict with the same four ideas --- ~name~,
+~description~, an object ~parameters~ block, and one ~directory~ property. Keep
+it next to the function in ~functions/get_files_info.py~:
+
+#+begin_src python
+  # ollama version --- functions/get_files_info.py
+  schema_get_files_info = {
+      "type": "function",
+      "function": {
+          "name": "get_files_info",
+          "description": "Lists files in a specified directory relative to the working directory, providing file size and directory status",
+          "parameters": {
+              "type": "object",
+              "properties": {
+                  "directory": {
+                      "type": "string",
+                      "description": "Directory path to list files from, relative to the working directory (default is the working directory itself)",
+                  },
+              },
+          },
+      },
+  }
+#+end_src
+
+Just as in the Gemini version, ~working_directory~ is /absent/ from the
+declaration. You pass it from the outside at dispatch, so the LLM never sees it
+or controls it.
+
+** Step 2: bundle into an available-functions list
+
+Gemini wraps declarations in a ~types.Tool~. Ollama just wants a list --- no
+wrapper type exists or is needed:
+
+#+begin_src python
+  # google-genai
+  available_functions = types.Tool(function_declarations=[schema_get_files_info])
+
+  # ollama --- a plain list (put it in call_function.py or schemas.py)
+  available_functions = [schema_get_files_info]
+#+end_src
+
+Start with only ~get_files_info~ in the list; add the other three declarations
+once this round-trips.
+
+** Step 3: pass the tools to the model
+
+Gemini threads tools through a ~GenerateContentConfig~ alongside the system
+prompt. Ollama takes ~tools=~ as a direct keyword on ~chat()~, and the system
+prompt is simply the first message:
+
+#+begin_src python
+  # google-genai
+  config = types.GenerateContentConfig(
+      tools=[available_functions], system_instruction=system_prompt
+  )
+
+  # ollama
+  messages = [
+      {"role": "system", "content": system_prompt},
+      {"role": "user", "content": args.user_prompt},
+  ]
+  response = chat(model="mistral:latest", messages=messages, tools=available_functions)
+#+end_src
+
+** Step 4: update the system prompt
+
+The instruction text is provider-agnostic --- copy the course's prompt almost
+verbatim. Put it in ~prompts.py~:
+
+#+begin_src python
+  system_prompt = """
+  You are a helpful AI coding agent.
+
+  When a user asks a question or makes a request, make a function call plan. You can perform the following operations:
+
+  - List files and directories
+
+  All paths you provide should be relative to the working directory. You do not need to specify the working directory in your function calls as it is automatically injected for security reasons.
+  """
+#+end_src
+
+** Step 5: print the function calls instead of the text
+
+Gemini exposes requested calls on ~response.function_calls~ (a list, or ~None~
+when empty). Ollama exposes them on ~response.message.tool_calls~ with the same
+"list or ~None~" contract. The per-call fields move from ~fc.name~ / ~fc.args~
+to ~tc.function.name~ / ~tc.function.arguments~:
+
+#+begin_src python
+  # google-genai
+  if response.function_calls:
+      for fc in response.function_calls:
+          print(f"Calling function: {fc.name}({fc.args})")
+  else:
+      print(response.text)
+
+  # ollama
+  if response.message.tool_calls:
+      for tc in response.message.tool_calls:
+          print(f"Calling function: {tc.function.name}({dict(tc.function.arguments)})")
+  else:
+      print(response.message.content)
+#+end_src
+
+The ~dict(...)~ wrap is cosmetic: ~tc.function.arguments~ is already a mapping,
+and wrapping it prints as a clean ~{'directory': '.'}~ rather than the SDK's
+repr.
+
+** Step 6: test with prompts that trigger a call
+
+Each response should be /either/ text /or/ one-or-more function calls --- never
+both. Try:
+
+- ~"what files are in the root?"~ :: ~get_files_info({'directory': '.'})~
+- ~"what files are in the pkg directory?"~ :: ~get_files_info({'directory': 'pkg'})~
+
+We are not executing anything yet --- this step only proves the model knows
+which functions exist and can request them correctly. Wiring up the actual
+call and feeding the result back is the loop from the earlier sections.
+
+* References
+
+- [[https://github.com/ollama/ollama-python/blob/main/README.md][Ollama Python SDK README]]
+- [[https://docs.ollama.com/capabilities/tool-calling][Ollama tool-calling docs]]

@@ -1,3 +1,4 @@
+from functions.call_function import available_functions
 from prompts import system_prompt
 from ollama import (
     chat,
@@ -24,18 +25,22 @@ def main():
     args = parser.parse_args()  # Now we have access to args.user_prompt.
 
     messages: list[Message] = [
-        Message(role="assistant", content=system_prompt),
+        Message(role="system", content=system_prompt),
         Message(role="user", content=args.user_prompt)
     ]
 
-    response: ChatResponse = chat(model="gemma4:12b", messages=messages)
+    response: ChatResponse = chat(model="gemma4:12b", messages=messages, tools=available_functions)
 
     if args.verbose:
         print(f"User prompt: {args.user_prompt}")
         print(f"Prompt tokens: {response.prompt_eval_count}")
         print(f"Response tokens: {response.eval_count}")
 
-    print(response.message.content)
+    if response.message.tool_calls:
+        for tool_call in response.message.tool_calls:
+            print(f"Calling function: {tool_call.function.name}({dict(tool_call.function.arguments)})")
+    else:
+        print(response.message.content)
 
 
 if __name__ == "__main__":

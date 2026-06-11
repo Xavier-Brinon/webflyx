@@ -24,3 +24,22 @@ def get_files_info(working_directory: str, directory: str = ".") -> str:
 
     except Exception as e:
         return f"Error: {e}"
+
+# functions/schemas.py
+schema_get_files_info = {
+    "type": "function",
+    "function": {
+        "name": "get_files_info",
+        "description": "Lists files in a specified directory, providing file size and directory status.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "directory": {
+                    "type": "string",
+                    "description": "Directory path to list files from.",
+                },
+            },
+            "required": ["directory"],
+        },
+    },
+}
