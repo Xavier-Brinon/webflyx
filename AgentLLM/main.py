@@ -1,4 +1,4 @@
-from functions.call_function import available_functions
+from functions.call_function import available_functions, call_function
 from prompts import system_prompt
 from ollama import (
     chat,
@@ -7,6 +7,10 @@ from ollama import (
 )
 import argparse
 
+
+gemma4 = "gemma4:12b"
+ministral = "ministral-3:14b"
+MAX_ITERS = 20
 # Just to get the check to pass, no use.
 # load_dotenv()
 # models.generate_content
@@ -29,18 +33,32 @@ def main():
         Message(role="user", content=args.user_prompt)
     ]
 
-    response: ChatResponse = chat(model="gemma4:12b", messages=messages, tools=available_functions)
+    for _ in range(MAX_ITERS):
+        response: ChatResponse = chat(model=gemma4, messages=messages, tools=available_functions)
+        messages.append(response.message)
+
+        if not response.message.tool_calls:
+            print("Final response:")
+            print(response.message.content)
+            break
+
+        function_results = []
+        for tool_call in response.message.tool_calls:
+            function_call_result = call_function(tool_call, verbose=args.verbose)
+            if not function_call_result.content:
+                raise Exception(f"call_function returned no content for {tool_call.function.name}")
+            function_results.append(function_call_result)
+            if args.verbose:
+                print(f"-> {function_call_result.content}")
+        messages.extend(function_results)
+    else:
+        print(f"Agent stopped after {MAX_ITERS} iterations without a final response.")
+        sys.exit(1)
 
     if args.verbose:
         print(f"User prompt: {args.user_prompt}")
         print(f"Prompt tokens: {response.prompt_eval_count}")
         print(f"Response tokens: {response.eval_count}")
-
-    if response.message.tool_calls:
-        for tool_call in response.message.tool_calls:
-            print(f"Calling function: {tool_call.function.name}({dict(tool_call.function.arguments)})")
-    else:
-        print(response.message.content)
 
 
 if __name__ == "__main__":

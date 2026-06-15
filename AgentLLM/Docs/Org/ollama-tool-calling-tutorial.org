@@ -425,6 +425,536 @@ We are not executing anything yet --- this step only proves the model knows
 which functions exist and can request them correctly. Wiring up the actual
 call and feeding the result back is the loop from the earlier sections.
 
+* Gotchas: weak-model tool selection
+
+When the loop "works" but the model keeps picking the /wrong/ tool, the bug is
+usually not in the wiring --- all tools are registered, the model just routes
+badly. Three real causes, in the order they bit this project:
+
+** The system prompt advertised only one capability
+
+The Boot.dev step-4 prompt lists only "List files and directories", because at
+that point in the course ~get_files_info~ was the only function. If you
+implement the other three but leave that prompt, the model reads the prose as
+"the only thing I can do is list files" and funnels /every/ request --- "read
+main.py", "run main.py" --- into ~get_files_info~.
+
+The ~tools=~ array and the system prompt are two separate channels, and they
+must agree. The array says four tools exist; the prose must say so too. Fix: list
+all operations in the prompt.
+
+** Terse, overlapping tool descriptions
+
+A description is the model's /routing table/ --- a 12B model pattern-matches the
+request against the description text rather than reasoning abstractly. Terse
+descriptions that overlap ("Read file contents." vs "Lists files…") give the
+weak router nothing to discriminate on. Fix: make each description contrastive,
+load it with the user's likely verbs (read / view / show, run / execute /
+launch), and add an explicit /negative/ where tools compete:
+
+#+begin_src python
+  # get_files_info description
+  "List the names, sizes, and directory status of the entries inside a "
+  "directory. Use this ONLY to browse or list a folder's contents. Do NOT "
+  "use this to read the text inside a file -- use get_file_content for that."
+#+end_src
+
+** Tool-ordering (positional) bias
+
+The ~tools=~ list is serialized into the prompt /in array order/, so
+~available_functions[0]~ literally appears first in the model's context. A weak
+or uncertain model anchors on the first-listed tool as its default. With
+~schema_get_files_info~ at index 0, ambiguous requests collapsed onto it;
+re-ordering the list so it is no longer first made the better-matching tool win.
+
+This is a /symptom-level/ fix --- it depends on a brittle property of a small
+model and can regress when you rephrase a request or add a fifth tool. Treat a
+tool choice that flips with array order as a signal that the model is the weak
+link, not as a solution.
+
+** The durable levers
+
+In increasing order of confidence:
+
+- Contrastive descriptions :: make each tool win on meaning, not position.
+- ~temperature: 0~ :: pass ~options={"temperature": 0}~ to ~chat()~ so selection
+  is deterministic while you tune --- it stops the choice from drifting between
+  runs.
+- A stronger local model :: ~mistral:latest~ ships a native tool template and is
+  far less position-sensitive than Gemma. This is the highest-confidence fix
+  when routing stays fragile after the prompt and descriptions are clean.
+
+* Exercise: calling the function, Ollama-adapted
+
+Now the agent can /choose/ a tool; this step actually /runs/ it. The Boot.dev
+course wraps that in a ~call_function~ helper and --- because it targets
+~google-genai~ --- buries the result inside a ~types.Content~ holding a
+~types.Part.from_function_response~. Ollama has no such envelope: a tool result
+is just a ~Message~ with ~role="tool"~ and a string ~content~. So most of the
+"ceremony" the assignment warns about simply evaporates.
+
+This section overlaps with [[*Executing a call and feeding the result back][Executing a call and feeding the result back]] on
+purpose --- that section showed the moves inline; here we package them into the
+course's named ~call_function~ helper so the signatures line up.
+
+** Concept mapping
+
+| Concept            | google-genai (Gemini)                                   | ollama-python                              |
+|--------------------+---------------------------------------------------------+--------------------------------------------|
+| The call object    | ~types.FunctionCall~                                    | a ~tool_call~ from ~message.tool_calls~    |
+| Name / arguments   | ~function_call.name~ / ~.args~                          | ~tool_call.function.name~ / ~.arguments~   |
+| Result wrapper     | ~types.Content(role="tool", parts=[…])~                 | ~Message(role="tool", …)~ (a dict is fine) |
+| Result payload     | ~types.Part.from_function_response(name, {"result":s})~ | ~content=str(result)~ + ~tool_name=name~   |
+| Error payload      | ~response={"error": …}~                                 | ~content="Error: …"~                       |
+| Reading the result | ~parts[0].function_response.response~                   | ~message.content~                          |
+
+The whole right-hand column is /flatter/: Gemini nests the answer three objects
+deep and makes each layer optional (so the course has you raise on every
+~None~); Ollama hands you one ~Message~ whose ~content~ is already your string.
+
+** Step 1: the signature and the dispatch map
+
+The course's Gemini signature takes a ~types.FunctionCall~ and returns a
+~types.Content~:
+
+#+begin_src python
+  # google-genai version (for reference only)
+  def call_function(function_call: types.FunctionCall, verbose: bool = False) -> types.Content:
+      ...
+#+end_src
+
+The Ollama equivalent takes one ~tool_call~ and returns a ~Message~. The type to
+annotate it with is ~Message.ToolCall~ --- a nested class on the same ~Message~
+you already import (~tool_calls~ is typed ~Sequence[Message.ToolCall]~, so one
+element is ~Message.ToolCall~). Keep it in ~functions/call_function.py~, beside
+the dispatch map:
+
+#+begin_src python
+  # functions/call_function.py
+  from collections.abc import Callable
+  from ollama import Message
+
+  WORKING_DIR = "./calculator"   # set by YOU, never by the model
+
+  function_map: dict[str, Callable[..., str]] = {
+      "get_files_info": get_files_info,
+      "get_file_content": get_file_content,
+      "write_file": write_file,
+      "run_python_file": run_python_file,
+  }
+
+  def call_function(tool_call: Message.ToolCall, verbose: bool = False) -> Message:
+      ...
+#+end_src
+
+#+begin_quote
+*Gotcha:* unlike Gemini, where ~function_call.name~ and ~.args~ are /optional/,
+the Ollama SDK types ~tool_call.function.name~ as a plain ~str~ and
+~.arguments~ as a ~Mapping[str, Any]~ --- *neither is ~None~-able*. So the
+~or ""~ and ~if … else {}~ guards ported from the course are belt-and-suspenders
+here: harmless, but defending against a ~None~ the types say cannot occur. Keep
+the ~dict(...)~ wrap regardless --- not for the ~None~ case, but because a
+~Mapping~ is read-only and you need a real ~dict~ to assign ~working_directory~.
+#+end_quote
+
+** Step 2: name, verbose print, and the unknown-tool guard
+
+Pull the name out as a guaranteed string (~or ""~ defends against a ~None~), then
+print per the verbose flag --- the course wants two different formats:
+
+#+begin_src python
+  function_name = tool_call.function.name or ""
+
+  if verbose:
+      print(f"Calling function: {function_name}({dict(tool_call.function.arguments)})")
+  else:
+      print(f" - Calling function: {function_name}")
+#+end_src
+
+If the name is not in ~function_map~, return an /error tool message/ rather than
+raising. Where Gemini builds a ~Content~ with ~response={"error": …}~, you set
+~content~ to an error string the model can read and recover from:
+
+#+begin_src python
+  fn = function_map.get(function_name)
+  if fn is None:
+      return Message(
+          role="tool",
+          tool_name=function_name,
+          content=f"Error: Unknown function: {function_name}",
+      )
+#+end_src
+
+** Step 3: copy args, inject the boundary, call
+
+Shallow-copy the arguments so you own them, then overwrite ~working_directory~
+--- exactly the security move from [[*Defining your tools --- and the trap hiding in your code][the schema section]]. ~dict(...)~
+both copies and turns a missing ~arguments~ into an empty dict:
+
+#+begin_src python
+  function_args = dict(tool_call.function.arguments) if tool_call.function.arguments else {}
+  function_args["working_directory"] = WORKING_DIR   # you inject the boundary, not the model
+
+  function_result = fn(**function_args)              # your functions always return str
+#+end_src
+
+The local is named ~function_args~ (not ~args~) on purpose: ~main.py~ already has
+an ~args~ from ~argparse~, so distinct names keep the CLI namespace and the
+tool arguments unambiguous when you read across both files.
+
+** Step 4: wrap the result in a tool message
+
+Gemini shoves the string into ~response={"result": function_result}~ because
+~from_function_response~ demands a dict. Ollama wants the string directly:
+
+#+begin_src python
+  return Message(
+      role="tool",
+      tool_name=function_name,   # ties this result to that request
+      content=str(function_result),
+  )
+#+end_src
+
+#+begin_quote
+*Insight:* the Gemini ~{"result": …}~ / ~{"error": …}~ split is an artifact of
+~from_function_response~ needing /structured/ JSON. Ollama's tool channel is
+plain text, so the distinction collapses --- both success and failure are just
+strings the model reads. You lose the typed envelope but keep the only thing
+that matters to a weak model: human-legible feedback.
+#+end_quote
+
+** Step 5: call it from main, and the validation that mostly vanishes
+
+The Gemini assignment makes you dig through ~result.parts[0].function_response.response~
+and raise an exception at each layer that could be ~None~. With Ollama,
+~call_function~ already returns the ~Message~ you append --- there is no nested
+structure to validate. The faithful translation is a single guard on ~content~:
+
+#+begin_src python
+  function_call_result = call_function(tool_call, verbose=args.verbose)
+
+  if not function_call_result.content:
+      raise Exception(f"call_function returned no content for {tool_call.function.name}")
+
+  function_results.append(function_call_result)   # we use this list in the loop later
+
+  if args.verbose:
+      print(f"-> {function_call_result.content}")
+#+end_src
+
+*Where this goes.* The snippet is the new /body/ of the existing
+~for tool_call in response.message.tool_calls~ loop --- it replaces the
+print-only stage from the previous exercise. Three concrete edits to ~main.py~:
+
+1. Add the import near the top (you already pull ~available_functions~ from this
+   same module): ~from functions.call_function import call_function~.
+2. Initialize ~function_results = []~ /before/ the ~if response.message.tool_calls:~,
+   not inside the ~for~ --- inside the loop it would reset every iteration and
+   you would keep only the last result.
+3. Delete the old ~print(f"Calling function: …")~ line entirely. That print now
+   lives /inside/ ~call_function~ (Step 2); leaving it in ~main.py~ double-prints
+   the call line each round.
+
+#+begin_src python
+  # before --- the print-only stage
+  if response.message.tool_calls:
+      for tool_call in response.message.tool_calls:
+          print(f"Calling function: {tool_call.function.name}({dict(tool_call.function.arguments)})")
+  else:
+      print(response.message.content)
+
+  # after --- dispatch through call_function
+  function_results = []
+
+  if response.message.tool_calls:
+      for tool_call in response.message.tool_calls:
+          function_call_result = call_function(tool_call, verbose=args.verbose)
+          if not function_call_result.content:
+              raise Exception(f"call_function returned no content for {tool_call.function.name}")
+          function_results.append(function_call_result)
+          if args.verbose:
+              print(f"-> {function_call_result.content}")
+  else:
+      print(response.message.content)
+#+end_src
+
+#+begin_quote
+*Gotcha:* the course's three-layer ~None~-checking (~parts~, then
+~function_response~, then ~response~) is /Gemini self-defence/, not a universal
+rule. Porting it verbatim to Ollama would have you assert on fields that do not
+exist. Translate the /intent/ --- "make sure a result actually came back" ---
+not the field names.
+#+end_quote
+
+** Step 6: test each function
+
+Run with ~--verbose~ so you watch the dispatch and the ~->~ result line:
+
+- *List:* ~uv run main.py "what files are in the root?" --verbose~
+- *Read:* ~uv run main.py "show me the contents of main.py" --verbose~
+- *Write:* ~uv run main.py "create lorem.txt with the text hello" --verbose~ ---
+  then check ~./calculator/lorem.txt~ (write something new; do not clobber).
+- *Run:* ~uv run main.py "run the calculator tests" --verbose~ --- this should
+  dispatch ~run_python_file~ against ~tests.py~.
+
+We are /not/ passing the results back to the LLM yet --- ~call_function~ returns
+the tool message, and we stash it, but the conversation does not continue. That
+final wiring is the [[*Putting it in a loop (with a seatbelt)][seatbelt loop]]: append each tool message to ~messages~
+and call ~chat()~ again until ~tool_calls~ is empty.
+
+* Exercise: the agent loop, Ollama-adapted
+
+One function-call round is not an agent --- it has no /feedback loop/. An agent
+calls the model, runs the tools the model asked for, /feeds the results back/,
+and lets the model decide what to do next, over and over, until it has a final
+answer. The conversation grows like this:
+
+#+begin_example
+  user:  Please fix the bug in the calculator
+  model: I want to call get_files_info...
+  tool:  Here is the result of get_files_info...
+  model: I want to call get_file_content...
+  tool:  Here is the result of get_file_content...
+  model: I want to call run_python_file...
+  tool:  Here is the result of run_python_file...
+  model: I fixed the bug and re-ran the calculator to confirm it works.
+#+end_example
+
+You already built the pieces: [[*Exercise: calling the function, Ollama-adapted][~call_function~]] runs one tool and returns a
+~role="tool"~ ~Message~. This step wraps the whole thing in the bounded loop
+from [[*Putting it in a loop (with a seatbelt)][Putting it in a loop (with a seatbelt)]] and wires the results /back/ into
+the conversation. The single biggest Gemini-to-Ollama divergence lives here.
+
+** Concept mapping
+
+| Concept               | google-genai (Gemini)                                  | ollama-python                              |
+|-----------------------+--------------------------------------------------------+--------------------------------------------|
+| Loop body             | ~client.models.generate_content(...)~                  | ~chat(...)~                                |
+| Iteration cap         | ~for _ in range(20):~                                  | identical                                  |
+| The model's reply     | ~response.candidates~ (a /list/ of turns)              | ~response.message~ (exactly /one/ turn)    |
+| Append the model turn | ~for c in candidates: messages.append(c.content)~      | ~messages.append(response.message)~ (once) |
+| Append tool results   | ~messages.append(Content(role="user", parts=results))~ | ~messages.extend(function_results)~        |
+| Result message role   | ~role="user"~ (wrapped parts)                          | ~role="tool"~ (one ~Message~ each)         |
+| "Are we done?"        | ~not response.function_calls~                          | ~not response.message.tool_calls~          |
+| Final text            | ~response.text~                                        | ~response.message.content~                 |
+
+#+begin_quote
+*The divergence that matters:* Gemini has you bundle every tool result into a
+single ~Content~ with ~role="user"~ --- as if /the user/ spoke the tool output.
+That is a Gemini convention. In Ollama each result is its own ~Message~ with
+~role="tool"~ (which ~call_function~ already returns), and you append them
+/individually/. Do *not* re-wrap them as one ~role="user"~ message --- that
+would mislabel tool output as something the human typed, and a weak model routes
+worse when the roles lie.
+#+end_quote
+
+** Step 1: cap the loop
+
+Wrap the model call in a bounded ~for~ so a confused agent cannot spin forever
+and burn tokens. Twenty is the course's suggested ceiling:
+
+#+begin_src python
+  MAX_ITERS = 20
+
+  for _ in range(MAX_ITERS):
+      response = chat(model=gemma4, messages=messages, tools=available_functions)
+      ...
+#+end_src
+
+** Step 2: append the model's turn (candidates collapse to one message)
+
+Gemini returns a /list/ of candidate turns and has you append each
+~candidate.content~ so the model sees its own prior reasoning next iteration.
+Ollama returns exactly one ~response.message~, so the whole loop over candidates
+collapses to a single append:
+
+#+begin_src python
+  messages.append(response.message)   # the model's turn, INCLUDING its tool_calls
+#+end_src
+
+This is the same line as the seatbelt loop. Appending ~response.message~ (not
+just its text) is what lets the model see /which tools it already requested/ on
+the next pass --- drop it and the agent forgets it ever called anything.
+
+** Step 3: run the tools and feed results back
+
+Collect each ~call_function~ result, then ~extend~ ~messages~ with the list ---
+the Ollama counterpart to Gemini's single ~role="user"~ bundle:
+
+#+begin_src python
+  function_results = []
+  for tool_call in response.message.tool_calls:
+      function_call_result = call_function(tool_call, verbose=args.verbose)
+      if not function_call_result.content:
+          raise Exception(f"empty result for {tool_call.function.name}")
+      function_results.append(function_call_result)   # each is role="tool"
+
+  messages.extend(function_results)   # flat tool messages -- NOT one role="user" Content
+#+end_src
+
+You could equally append each ~function_call_result~ to ~messages~ /inside/ the
+inner loop and skip ~function_results~ entirely; the collected-then-~extend~ form
+just lines up one-to-one with the course's "append the list at the end" wording.
+
+** Step 4: break on the final answer
+
+When the model returns no ~tool_calls~, it is done --- print the final text and
+leave the loop:
+
+#+begin_src python
+  if not response.message.tool_calls:
+      print("Final response:")
+      print(response.message.content)
+      break
+#+end_src
+
+Order matters: append the model turn (Step 2), then test for ~tool_calls~. If
+absent, ~break~ before you reach the tool-running code.
+
+** Step 5: fail loudly if the cap is hit
+
+If the loop exhausts ~MAX_ITERS~ without a final answer, say so and exit non-zero.
+Python's ~for/else~ is exactly the right tool --- the ~else~ runs only if the
+loop finished /without/ a ~break~:
+
+#+begin_src python
+  for _ in range(MAX_ITERS):
+      ...
+  else:
+      print(f"Agent stopped after {MAX_ITERS} iterations without a final response.")
+      sys.exit(1)   # import sys at the top; non-zero signals failure
+#+end_src
+
+** The whole loop, assembled
+
+Everything above, in order, replacing the single-round body of ~main.py~:
+
+#+begin_src python
+  import sys
+
+  MAX_ITERS = 20
+  messages: list[Message] = [
+      Message(role="system", content=system_prompt),
+      Message(role="user", content=args.user_prompt),
+  ]
+
+  for _ in range(MAX_ITERS):
+      response = chat(model=gemma4, messages=messages, tools=available_functions)
+      messages.append(response.message)               # Step 2: the model's turn
+
+      if not response.message.tool_calls:             # Step 4: done?
+          print("Final response:")
+          print(response.message.content)
+          break
+
+      function_results = []                           # Step 3: run tools, feed back
+      for tool_call in response.message.tool_calls:
+          function_call_result = call_function(tool_call, verbose=args.verbose)
+          if not function_call_result.content:
+              raise Exception(f"empty result for {tool_call.function.name}")
+          function_results.append(function_call_result)
+      messages.extend(function_results)
+  else:                                               # Step 5: cap hit
+      print(f"Agent stopped after {MAX_ITERS} iterations without a final response.")
+      sys.exit(1)
+#+end_src
+
+** Where this goes
+
+The assembled loop above /replaces the single-round body/ you wrote in the
+previous exercise --- ~main.py:35--55~, everything from the lone ~chat()~ call
+down through the ~if response.message.tool_calls: … else:~ block. What stays
+untouched is the ~argparse~ setup (~main.py:24--28~) and the ~messages~ list
+(~main.py:30--33~), which already match the loop's opening lines verbatim. Five
+concrete edits to the current ~main.py~:
+
+1. *Add ~import sys~ at the top*, beside ~import argparse~ (~main.py:8~). Step 5
+   calls ~sys.exit(1)~ and the file does not import it yet.
+2. *Define ~MAX_ITERS = 20~* next to the model constants (~main.py:11--12~),
+   mirroring where ~MAX_CHARS~ already lives in ~config.py~.
+3. *Wrap the ~chat()~ call in the ~for _ in range(MAX_ITERS):~ loop*, and append
+   the model's turn /immediately after/ it. The current line 35 is a single call
+   with no feedback; the loop body is ~response = chat(...)~ then
+   ~messages.append(response.message)~ (Step 2). That append is /new/ --- the
+   single-round version never recorded the model's reply.
+4. *Turn the ~else: print(response.message.content)~ (~main.py:54--55~) into an
+   early ~break~ at the top of the loop.* This is the one inversion that trips
+   people up: in the single-round code the final-text print is the /else branch/
+   of ~if tool_calls~; in the loop it must come /first/ as
+   ~if not response.message.tool_calls: print(...); break~ (Step 4), so the
+   dispatch code below it can run unconditionally once tool calls are present.
+5. *Add ~messages.extend(function_results)~ after the dispatch ~for~* (Step 3).
+   The current code builds ~function_results~ (~main.py:42--51~) but never sends
+   it back --- adding this one line is literally what upgrades the single round
+   into an agent. Because tool calls are now guaranteed by the Step-4 ~break~,
+   you can also drop the ~if response.message.tool_calls:~ guard (~main.py:44~)
+   that wrapped the dispatch loop.
+
+#+begin_quote
+*Gotcha:* the verbose token-print block (~main.py:37--40~) is absent from the
+assembled snippet, but you keep it --- just be aware it now lives /inside/ the
+loop, so it prints ~prompt_eval_count~/~eval_count~ /once per round/, not once
+per run. That is usually what you want when watching an agent burn tokens; if
+you only want the totals, move that block out below the loop instead.
+#+end_quote
+
+Before and after, side by side:
+
+#+begin_src python
+  # before --- single round (current main.py:35--55)
+  response: ChatResponse = chat(model=gemma4, messages=messages, tools=available_functions)
+
+  function_results = []
+  if response.message.tool_calls:
+      for tool_call in response.message.tool_calls:
+          function_call_result = call_function(tool_call, verbose=args.verbose)
+          if not function_call_result.content:
+              raise Exception(f"call_function returned no content for {tool_call.function.name}")
+          function_results.append(function_call_result)
+          if args.verbose:
+              print(f"-> {function_call_result.content}")
+  else:
+      print(response.message.content)              # <- final text as the ELSE branch
+
+  # after --- bounded agent loop
+  for _ in range(MAX_ITERS):
+      response = chat(model=gemma4, messages=messages, tools=available_functions)
+      messages.append(response.message)            # NEW: record the model's turn
+
+      if not response.message.tool_calls:          # final text now an EARLY break
+          print("Final response:")
+          print(response.message.content)
+          break
+
+      function_results = []
+      for tool_call in response.message.tool_calls:
+          function_call_result = call_function(tool_call, verbose=args.verbose)
+          if not function_call_result.content:
+              raise Exception(f"call_function returned no content for {tool_call.function.name}")
+          function_results.append(function_call_result)
+          if args.verbose:
+              print(f"-> {function_call_result.content}")
+      messages.extend(function_results)            # NEW: feed results back -> this is the agent
+  else:
+      print(f"Agent stopped after {MAX_ITERS} iterations without a final response.")
+      sys.exit(1)
+#+end_src
+
+** Step 6: now you are a prompt engineer
+
+If the agent loops when it should answer, or answers when it should keep working,
+the wiring is fine --- the /system prompt/ is the lever. Tell it explicitly to
+use tools to gather what it needs and then give a final summary. Try the
+course's warm-up prompt:
+
+#+begin_src shell
+  uv run main.py "how does the calculator render results to the console?" --verbose
+#+end_src
+
+You should see a couple of ~- Calling function:~ lines, then ~Final response:~
+followed by the model's explanation. If it stalls at ~MAX_ITERS~, your prompt ---
+not your loop --- is usually the thing to tune.
+
 * References
 
 - [[https://github.com/ollama/ollama-python/blob/main/README.md][Ollama Python SDK README]]
